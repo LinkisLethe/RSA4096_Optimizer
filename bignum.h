@@ -1,8 +1,8 @@
 /*****************************************************************************
 Filename    : bignum.h
-Author      : 
-Date        : 
-Description :
+Author      :
+Date        : 2026-5-11
+Description : Header file for big number arithmetic operations, including addition, subtraction, multiplication, division, modular operations, and comparisons. The big numbers are represented as arrays of 32-bit digits, allowing for efficient handling of large integers required in cryptographic applications such as RSA. The functions provided support various operations needed for RSA encryption and decryption, including modular exponentiation and Montgomery multiplication for optimized performance with odd moduli.
 *****************************************************************************/
 #ifndef __BIGNUM_H__
 #define __BIGNUM_H__
@@ -36,6 +36,9 @@ bn_t bn_shift_r(bn_t *a, bn_t *b, uint32_t c, uint32_t digits);                 
 void bn_mod(bn_t *a, bn_t *b, uint32_t bdigits, bn_t *c, uint32_t cdigits);                 // a = b mod c
 void bn_mod_mul(bn_t *a, bn_t *b, bn_t *c, bn_t *d, uint32_t digits);                       // a = b * c mod d
 void bn_mod_exp(bn_t *a, bn_t *b, bn_t *c, uint32_t cdigits, bn_t *d, uint32_t ddigits);    // a = b ^ c mod d
+
+//update for montgomery algorithm
+void bn_mod_mul_mont(bn_t *a, bn_t *b, bn_t *c, bn_t *d, uint32_t digits);                  // a = b * c mod d, Montgomery path for odd d
 void bn_mod_exp_mont(bn_t *a, bn_t *b, bn_t *c, uint32_t cdigits, bn_t *d, uint32_t ddigits);
 void bn_mod_exp_mont_e65537(bn_t *a, bn_t *b, bn_t *d, uint32_t ddigits);
 

@@ -2,7 +2,7 @@
 # Compiler flags
 #
 CC     = gcc
-CFLAGS = -Wall -Wextra -pthread
+CFLAGS = -Wall -Wextra
 
 #
 # Project files
@@ -11,9 +11,6 @@ CFLAGS = -Wall -Wextra -pthread
 SRCS = main.c rsa.c bignum.c
 OBJS = $(SRCS:.c=.o)
 EXE  = main
-BENCHSRCS = benchmark.c rsa.c bignum.c
-BENCHOBJS = $(BENCHSRCS:.c=.o)
-BENCHEXE  = benchmark
 
 #
 # Debug build settings
@@ -29,19 +26,17 @@ DBGCFLAGS = -g -O0 -DDEBUG
 RELDIR = release
 RELEXE = $(RELDIR)/$(EXE)
 RELOBJS = $(addprefix $(RELDIR)/, $(OBJS))
-RELBENCHEXE = $(RELDIR)/$(BENCHEXE)
-RELBENCHOBJS = $(addprefix $(RELDIR)/, $(BENCHOBJS))
 RELCFLAGS = -O3 -DNDEBUG
 
-.PHONY: all benchmark clean debug prep release remake
+.PHONY: all clean debug prep release remake
 
 # Default build
-all: release
+all: prep release
 
 #
 # Debug rules
 #
-debug: prep $(DBGEXE)
+debug: $(DBGEXE)
 
 $(DBGEXE): $(DBGOBJS)
 	$(CC) $(CFLAGS) $(DBGCFLAGS) -o $(DBGEXE) $^
@@ -52,15 +47,10 @@ $(DBGDIR)/%.o: %.c
 #
 # Release rules
 #
-release: prep $(RELEXE)
+release: $(RELEXE)
 
 $(RELEXE): $(RELOBJS)
 	$(CC) $(CFLAGS) $(RELCFLAGS) -o $(RELEXE) $^
-
-benchmark: prep $(RELBENCHEXE)
-
-$(RELBENCHEXE): $(RELBENCHOBJS)
-	$(CC) $(CFLAGS) $(RELCFLAGS) -o $(RELBENCHEXE) $^
 
 $(RELDIR)/%.o: %.c
 	$(CC) -c $(CFLAGS) $(RELCFLAGS) -o $@ $<
@@ -74,4 +64,4 @@ prep:
 remake: clean all
 
 clean:
-	rm -f $(RELEXE) $(RELOBJS) $(RELBENCHEXE) $(RELBENCHOBJS) $(DBGEXE) $(DBGOBJS)
+	rm -f $(RELEXE) $(RELOBJS) $(DBGEXE) $(DBGOBJS)

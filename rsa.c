@@ -1,14 +1,17 @@
 /*****************************************************************************
 Filename    : rsa.c
-Author      : 
-Date        : 
-Description :
+Author      :
+Date        : 2025-05-11
+Description : RSA4096 encryption/decryption implementation.
+              This version adds optimized public encryption for e = 65537,
+              64-bit Montgomery arithmetic, and CRT-based private decryption.
 *****************************************************************************/
+
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
-#include <pthread.h>
+#include <stdint.h>
 
 #include "rsa.h"
 #include "bignum.h"
@@ -19,100 +22,21 @@ Description :
 #define RSA_THREAD_LOCAL __thread
 #endif
 
-#define RSA_WORKER_THREADS 2
 #define RSA_FAST_WORDS (RSA_MAX_MODULUS_LEN / 8)
 
 typedef struct {
-    uint8_t *out;
-    uint8_t *in;
-    uint32_t in_len;
-    uint32_t modulus_len;
-    uint32_t max_plain_len;
-    uint32_t start_block;
-    uint32_t end_block;
-    int status;
-    rsa_pk_t *pk;
-} rsa_public_task_t;
+    int valid;
+    uint64_t n[RSA_FAST_WORDS];
+    uint64_t rr[RSA_FAST_WORDS];
+    uint64_t n0_inv;
+} rsa_fast_public_ctx_t;
 
-typedef struct {
-    uint8_t *out;
-    uint8_t *in;
-    uint32_t in_len;
-    uint32_t modulus_len;
-    uint32_t max_plain_len;
-    uint32_t start_block;
-    uint32_t end_block;
-    uint32_t *block_lens;
-    int status;
-    rsa_sk_t *sk;
-} rsa_private_task_t;
+static rsa_fast_public_ctx_t g_fast_public_ctx;
 
 static int private_block_operation(uint8_t *out, uint32_t *out_len, uint8_t *in, uint32_t in_len, rsa_sk_t *sk);
-static void *public_encrypt_worker(void *arg);
-static void *private_decrypt_worker(void *arg);
 static int public_block_operation_fast_e65537(uint8_t *out, uint32_t *out_len, uint8_t *in, uint32_t in_len, rsa_pk_t *pk);
 
-static void *public_encrypt_worker(void *arg)
-{
-    rsa_public_task_t *task = (rsa_public_task_t *)arg;
-    uint32_t block;
-
-    for(block = task->start_block; block < task->end_block; block++) {
-        uint32_t in_off = block * task->max_plain_len;
-        uint32_t chunk_len = task->in_len - in_off;
-        uint32_t out_len = 0;
-        int status;
-
-        if(chunk_len > task->max_plain_len) {
-            chunk_len = task->max_plain_len;
-        }
-
-        status = rsa_public_encrypt(task->out + block * task->modulus_len,
-                                    &out_len,
-                                    task->in + in_off,
-                                    chunk_len,
-                                    task->pk);
-        if(status != 0 || out_len != task->modulus_len) {
-            task->status = (status != 0) ? status : ERR_WRONG_LEN;
-            return NULL;
-        }
-    }
-
-    task->status = 0;
-    return NULL;
-}
-
-static void *private_decrypt_worker(void *arg)
-{
-    rsa_private_task_t *task = (rsa_private_task_t *)arg;
-    uint32_t block;
-
-    for(block = task->start_block; block < task->end_block; block++) {
-        uint32_t in_off = block * task->modulus_len;
-        uint32_t chunk_len = task->in_len - in_off;
-        uint32_t out_len = 0;
-        int status;
-
-        if(chunk_len > task->modulus_len) {
-            chunk_len = task->modulus_len;
-        }
-
-        status = rsa_private_decrypt(task->out + block * task->max_plain_len,
-                                     &out_len,
-                                     task->in + in_off,
-                                     chunk_len,
-                                     task->sk);
-        if(status != 0 || out_len > task->max_plain_len) {
-            task->status = (status != 0) ? status : ERR_WRONG_LEN;
-            return NULL;
-        }
-        task->block_lens[block] = out_len;
-    }
-
-    task->status = 0;
-    return NULL;
-}
-
+/* Decode big-endian bytes into little-endian 64-bit words. */
 static void decode_words64(uint64_t out[RSA_FAST_WORDS], uint8_t *in, uint32_t in_len)
 {
     uint32_t i, j;
@@ -127,6 +51,7 @@ static void decode_words64(uint64_t out[RSA_FAST_WORDS], uint8_t *in, uint32_t i
     }
 }
 
+/* Encode little-endian 64-bit words back into big-endian bytes. */
 static void encode_words64(uint8_t *out, uint64_t in[RSA_FAST_WORDS])
 {
     uint32_t i, j;
@@ -139,6 +64,7 @@ static void encode_words64(uint8_t *out, uint64_t in[RSA_FAST_WORDS])
     }
 }
 
+/* Compare two 4096-bit integers stored as 64-bit word arrays. */
 static int cmp_words64(uint64_t a[RSA_FAST_WORDS], uint64_t b[RSA_FAST_WORDS])
 {
     int i;
@@ -150,6 +76,7 @@ static int cmp_words64(uint64_t a[RSA_FAST_WORDS], uint64_t b[RSA_FAST_WORDS])
     return 0;
 }
 
+/* Compute a = a - b for word arrays; caller guarantees a >= b. */
 static void sub_words64(uint64_t a[RSA_FAST_WORDS], uint64_t b[RSA_FAST_WORDS])
 {
     uint64_t borrow = 0;
@@ -163,6 +90,7 @@ static void sub_words64(uint64_t a[RSA_FAST_WORDS], uint64_t b[RSA_FAST_WORDS])
     }
 }
 
+/* Compute -n^{-1} mod 2^64 for Montgomery reduction. */
 static uint64_t mont_inv64(uint64_t n0)
 {
     uint64_t x = 1;
@@ -174,18 +102,7 @@ static uint64_t mont_inv64(uint64_t n0)
     return (uint64_t)(0 - x);
 }
 
-static void one_mont64(uint64_t out[RSA_FAST_WORDS], uint64_t n[RSA_FAST_WORDS])
-{
-    uint64_t carry = 1;
-    uint32_t i;
-
-    for(i=0; i<RSA_FAST_WORDS; i++) {
-        __uint128_t sum = (__uint128_t)(~n[i]) + carry;
-        out[i] = (uint64_t)sum;
-        carry = (uint64_t)(sum >> 64);
-    }
-}
-
+/* Compute a = (2 * a) mod n, used to build R^2 mod n. */
 static void shift_left_mod64(uint64_t a[RSA_FAST_WORDS], uint64_t n[RSA_FAST_WORDS])
 {
     uint64_t carry = 0;
@@ -202,16 +119,19 @@ static void shift_left_mod64(uint64_t a[RSA_FAST_WORDS], uint64_t n[RSA_FAST_WOR
     }
 }
 
-static void to_mont64(uint64_t out[RSA_FAST_WORDS], uint64_t a[RSA_FAST_WORDS], uint64_t n[RSA_FAST_WORDS])
+/* Compute R^2 mod n for the 4096-bit Montgomery domain. */
+static void rr_mont64(uint64_t out[RSA_FAST_WORDS], uint64_t n[RSA_FAST_WORDS])
 {
     uint32_t i;
 
-    memcpy(out, a, RSA_MAX_MODULUS_LEN);
-    for(i=0; i<RSA_MAX_MODULUS_BITS; i++) {
+    memset(out, 0, RSA_MAX_MODULUS_LEN);
+    out[0] = 1;
+    for(i=0; i<2 * RSA_MAX_MODULUS_BITS; i++) {
         shift_left_mod64(out, n);
     }
 }
 
+/* 64-bit Montgomery multiplication: out = a * b * R^{-1} mod n. */
 static void mont_mul64(uint64_t out[RSA_FAST_WORDS],
                        uint64_t a[RSA_FAST_WORDS],
                        uint64_t b[RSA_FAST_WORDS],
@@ -255,6 +175,10 @@ static void mont_mul64(uint64_t out[RSA_FAST_WORDS],
     }
 }
 
+/*
+ * Checks whether the public exponent is 65537.
+ * This allows the encryption path to use the optimized e = 65537 routine.
+ */
 static int pk_exponent_is_65537(rsa_pk_t *pk)
 {
     uint32_t i;
@@ -270,10 +194,53 @@ static int pk_exponent_is_65537(rsa_pk_t *pk)
            pk->exponent[RSA_MAX_MODULUS_LEN-1] == 0x01;
 }
 
+
+/*
+ * Builds or reuses cached Montgomery parameters for public encryption.
+ * The cache avoids recomputing n, R^2 mod n, and n0_inv for every block.
+ */
+static int get_fast_public_ctx(rsa_pk_t *pk,
+                               uint64_t n[RSA_FAST_WORDS],
+                               uint64_t rr[RSA_FAST_WORDS],
+                               uint64_t *n0_inv)
+{
+    uint64_t decoded_n[RSA_FAST_WORDS] = {0};
+
+    decode_words64(decoded_n, pk->modulus, RSA_MAX_MODULUS_LEN);
+    if((decoded_n[0] & 1) == 0 || ((decoded_n[RSA_FAST_WORDS - 1] >> 63) == 0)) {
+        return ERR_WRONG_LEN;
+    }
+
+    if(g_fast_public_ctx.valid &&
+       cmp_words64(g_fast_public_ctx.n, decoded_n) == 0) {
+        memcpy(n, g_fast_public_ctx.n, RSA_MAX_MODULUS_LEN);
+        memcpy(rr, g_fast_public_ctx.rr, RSA_MAX_MODULUS_LEN);
+        *n0_inv = g_fast_public_ctx.n0_inv;
+        return 0;
+    }
+
+    memcpy(g_fast_public_ctx.n, decoded_n, RSA_MAX_MODULUS_LEN);
+    g_fast_public_ctx.n0_inv = mont_inv64(decoded_n[0]);
+    rr_mont64(g_fast_public_ctx.rr, decoded_n);
+    g_fast_public_ctx.valid = 1;
+
+    memcpy(n, g_fast_public_ctx.n, RSA_MAX_MODULUS_LEN);
+    memcpy(rr, g_fast_public_ctx.rr, RSA_MAX_MODULUS_LEN);
+    *n0_inv = g_fast_public_ctx.n0_inv;
+    return 0;
+}
+
+
+/*
+ * Fast RSA public block operation for e = 65537.
+ * Uses 64-bit Montgomery multiplication and computes m^65537 mod n
+ * as 16 squarings plus 1 multiplication.
+ */
 static int public_block_operation_fast_e65537(uint8_t *out, uint32_t *out_len, uint8_t *in, uint32_t in_len, rsa_pk_t *pk)
 {
     uint64_t m[RSA_FAST_WORDS] = {0};
     uint64_t n[RSA_FAST_WORDS] = {0};
+    uint64_t rr[RSA_FAST_WORDS] = {0};
     uint64_t one[RSA_FAST_WORDS] = {0};
     uint64_t base[RSA_FAST_WORDS] = {0};
     uint64_t result[RSA_FAST_WORDS] = {0};
@@ -287,8 +254,7 @@ static int public_block_operation_fast_e65537(uint8_t *out, uint32_t *out_len, u
     }
 
     decode_words64(m, in, in_len);
-    decode_words64(n, pk->modulus, RSA_MAX_MODULUS_LEN);
-    if((n[0] & 1) == 0 || ((n[RSA_FAST_WORDS - 1] >> 63) == 0)) {
+    if(get_fast_public_ctx(pk, n, rr, &n0_inv) != 0) {
         return ERR_WRONG_LEN;
     }
     if(cmp_words64(m, n) >= 0) {
@@ -296,9 +262,7 @@ static int public_block_operation_fast_e65537(uint8_t *out, uint32_t *out_len, u
     }
 
     one[0] = 1;
-    n0_inv = mont_inv64(n[0]);
-    one_mont64(result, n);
-    to_mont64(base, m, n);
+    mont_mul64(base, m, rr, n, n0_inv);
     memcpy(result, base, RSA_MAX_MODULUS_LEN);
 
     for(i=0; i<16; i++) {
@@ -312,6 +276,7 @@ static int public_block_operation_fast_e65537(uint8_t *out, uint32_t *out_len, u
 
     memset(m, 0, sizeof(m));
     memset(n, 0, sizeof(n));
+    memset(rr, 0, sizeof(rr));
     memset(base, 0, sizeof(base));
     memset(result, 0, sizeof(result));
 
@@ -339,152 +304,48 @@ int rsa_private_encrypt_any_len(uint8_t *out, uint32_t *out_len, uint8_t *in, ui
 	return status;
 }
 
+/* Encrypt arbitrary-length input by splitting it into PKCS#1-sized blocks. */
 int rsa_public_encrypt_any_len(uint8_t *out, uint32_t *out_len, uint8_t *in, uint32_t in_len, rsa_pk_t *pk){
     uint32_t modulus_len = (pk->bits + 7) / 8;
     uint32_t max_plain_len = modulus_len - 11;
-    uint32_t block_count;
-    uint32_t worker_count;
-    pthread_t threads[RSA_WORKER_THREADS];
-    rsa_public_task_t tasks[RSA_WORKER_THREADS];
-    uint32_t i, created = 0;
+    uint8_t *tmp_o = out;
+    uint32_t len = 0;
+    int status = 0;
+    uint32_t off;
 
     *out_len = 0;
-    if(in_len == 0) {
-        return 0;
-    }
-
-    block_count = (in_len + max_plain_len - 1) / max_plain_len;
-    worker_count = (block_count < RSA_WORKER_THREADS) ? block_count : RSA_WORKER_THREADS;
-
-    for(i=0; i<worker_count; i++) {
-        tasks[i].out = out;
-        tasks[i].in = in;
-        tasks[i].in_len = in_len;
-        tasks[i].modulus_len = modulus_len;
-        tasks[i].max_plain_len = max_plain_len;
-        tasks[i].start_block = (block_count * i) / worker_count;
-        tasks[i].end_block = (block_count * (i + 1)) / worker_count;
-        tasks[i].status = 0;
-        tasks[i].pk = pk;
-        if(pthread_create(&threads[i], NULL, public_encrypt_worker, &tasks[i]) != 0) {
-            break;
+    for(off=0; off<in_len && status==0; off+=max_plain_len) {
+        uint32_t chunk_len = in_len - off;
+        if(chunk_len > max_plain_len) {
+            chunk_len = max_plain_len;
         }
-        created++;
+        status = rsa_public_encrypt(tmp_o, &len, in + off, chunk_len, pk);
+        tmp_o += len;
+        *out_len += len;
     }
-
-    if(created != worker_count) {
-        uint8_t *tmp_o = out;
-        uint32_t len = 0;
-        int status = 0;
-        for(i=0; i<created; i++) {
-            pthread_join(threads[i], NULL);
-        }
-        for(uint32_t off=0; off<in_len && status==0; off+=max_plain_len) {
-            uint32_t chunk_len = in_len - off;
-            if(chunk_len > max_plain_len) {
-                chunk_len = max_plain_len;
-            }
-            status = rsa_public_encrypt(tmp_o, &len, in + off, chunk_len, pk);
-            tmp_o += len;
-            *out_len += len;
-        }
-        return status;
-    }
-
-    for(i=0; i<worker_count; i++) {
-        pthread_join(threads[i], NULL);
-        if(tasks[i].status != 0) {
-            return tasks[i].status;
-        }
-    }
-
-    *out_len = block_count * modulus_len;
-    return 0;
+    return status;
 }
 
 
+/* Decrypt arbitrary-length ciphertext by processing one RSA block at a time. */
 int rsa_private_decrypt_any_len(uint8_t *out, uint32_t *out_len, uint8_t *in, uint32_t in_len, rsa_sk_t *sk){
     uint32_t modulus_len = (sk->bits + 7) / 8;
-    uint32_t max_plain_len = modulus_len - 11;
-    uint32_t block_count;
-    uint32_t worker_count;
-    uint8_t *tmp_out;
-    uint32_t *block_lens;
-    pthread_t threads[RSA_WORKER_THREADS];
-    rsa_private_task_t tasks[RSA_WORKER_THREADS];
-    uint32_t i, created = 0;
+    uint8_t *tmp_o = out;
+    uint32_t len = 0;
+    int status = 0;
+    uint32_t off;
 
     *out_len = 0;
-    if(in_len == 0) {
-        return 0;
-    }
-
-    block_count = (in_len + modulus_len - 1) / modulus_len;
-    worker_count = (block_count < RSA_WORKER_THREADS) ? block_count : RSA_WORKER_THREADS;
-    tmp_out = (uint8_t *)malloc(block_count * max_plain_len);
-    block_lens = (uint32_t *)malloc(block_count * sizeof(uint32_t));
-    if(tmp_out == NULL || block_lens == NULL) {
-        free(tmp_out);
-        free(block_lens);
-        return ERR_WRONG_DATA;
-    }
-    memset(block_lens, 0, block_count * sizeof(uint32_t));
-
-    for(i=0; i<worker_count; i++) {
-        tasks[i].out = tmp_out;
-        tasks[i].in = in;
-        tasks[i].in_len = in_len;
-        tasks[i].modulus_len = modulus_len;
-        tasks[i].max_plain_len = max_plain_len;
-        tasks[i].start_block = (block_count * i) / worker_count;
-        tasks[i].end_block = (block_count * (i + 1)) / worker_count;
-        tasks[i].block_lens = block_lens;
-        tasks[i].status = 0;
-        tasks[i].sk = sk;
-        if(pthread_create(&threads[i], NULL, private_decrypt_worker, &tasks[i]) != 0) {
-            break;
+    for(off=0; off<in_len && status==0; off+=modulus_len) {
+        uint32_t chunk_len = in_len - off;
+        if(chunk_len > modulus_len) {
+            chunk_len = modulus_len;
         }
-        created++;
+        status = rsa_private_decrypt(tmp_o, &len, in + off, chunk_len, sk);
+        tmp_o += len;
+        *out_len += len;
     }
-
-    if(created != worker_count) {
-        uint8_t *tmp_o = out;
-        uint32_t len = 0;
-        int status = 0;
-        for(i=0; i<created; i++) {
-            pthread_join(threads[i], NULL);
-        }
-        free(tmp_out);
-        free(block_lens);
-        for(uint32_t off=0; off<in_len && status==0; off+=modulus_len) {
-            uint32_t chunk_len = in_len - off;
-            if(chunk_len > modulus_len) {
-                chunk_len = modulus_len;
-            }
-            status = rsa_private_decrypt(tmp_o, &len, in + off, chunk_len, sk);
-            tmp_o += len;
-            *out_len += len;
-        }
-        return status;
-    }
-
-    for(i=0; i<worker_count; i++) {
-        pthread_join(threads[i], NULL);
-        if(tasks[i].status != 0) {
-            free(tmp_out);
-            free(block_lens);
-            return tasks[i].status;
-        }
-    }
-
-    for(i=0; i<block_count; i++) {
-        memcpy(out + *out_len, tmp_out + i * max_plain_len, block_lens[i]);
-        *out_len += block_lens[i];
-    }
-
-    free(tmp_out);
-    free(block_lens);
-    return 0;
+    return status;
 }
 
 int rsa_private_encrypt(uint8_t *out, uint32_t *out_len, uint8_t *in, uint32_t in_len, rsa_sk_t *sk)
@@ -595,7 +456,7 @@ static int private_block_operation(uint8_t *out, uint32_t *out_len, uint8_t *in,
     if(bn_sub(diff, m1, m2_mod_p, pdigits)) {
         bn_add(diff, diff, p, pdigits);
     }
-    bn_mod_mul(h, qinv, diff, p, pdigits);
+    bn_mod_mul_mont(h, qinv, diff, p, pdigits);
 
     bn_mul(qh, q, h, prime_digits);
     bn_assign(m2_wide, m2, qdigits);
@@ -647,29 +508,6 @@ void generate_rand(uint8_t *block, uint32_t block_len)
     }
 }
 
-
-// int rsa_public_decrypt_any_len(uint8_t *out, uint32_t *out_len, uint8_t *in, uint32_t in_len, rsa_pk_t *pk){
-// 	int status=0;
-// 	int len=0;
-// 	uint8_t *tmp_o=out;
-// 	*out_len=0;
-// 	for(int i=0;i<in_len && status==0;i+=RSA_MAX_MODULUS_LEN){
-// 		if((in_len-i)>RSA_MAX_MODULUS_LEN){
-// 			status=rsa_public_decrypt(tmp_o,&len,in,RSA_MAX_MODULUS_LEN,pk);
-// 		}
-// 		else{
-// 			status=rsa_public_decrypt(tmp_o,&len,in,in_len-i,pk);
-// 			break;
-// 		}
-// 		tmp_o=tmp_o+len;
-// 		*out_len+=len;
-// 	}
-// 	tmp_o=NULL;
-// 	free(tmp_o);
-// 	// *out_len=len;
-// 	return status;
-// }
-
 int rsa_public_encrypt(uint8_t *out, uint32_t *out_len, uint8_t *in, uint32_t in_len, rsa_pk_t *pk)
 {
     int status;
@@ -700,43 +538,7 @@ int rsa_public_encrypt(uint8_t *out, uint32_t *out_len, uint8_t *in, uint32_t in
     return status;
 }
 
-// int rsa_public_decrypt(uint8_t *out, uint32_t *out_len, uint8_t *in, uint32_t in_len, rsa_pk_t *pk) {
-//     int status;
-//     uint8_t pkcs_block[RSA_MAX_MODULUS_LEN];
-//     uint32_t i, modulus_len, pkcs_block_len;
 
-//     modulus_len = (pk->bits + 7) / 8;
-//     if (in_len > modulus_len)
-//         return ERR_WRONG_LEN;
-
-//     status = public_block_operation(pkcs_block, &pkcs_block_len, in, in_len, pk);
-//     if (status != 0)
-//         return status;
-
-//     if (pkcs_block_len != modulus_len)
-//         return ERR_WRONG_LEN;
-
-//     if ((pkcs_block[0] != 0) || (pkcs_block[1] != 1))
-//         return ERR_WRONG_DATA;
-
-//     for (i = 2; i < modulus_len - 1; i++) {
-//         if (pkcs_block[i] != 0xFF) break;
-//     }
-
-//     if (pkcs_block[i++] != 0)
-//         return ERR_WRONG_DATA;
-
-//     *out_len = modulus_len - i;
-//     if (*out_len + 11 > modulus_len)
-//         return ERR_WRONG_DATA;
-
-//     memcpy((uint8_t *) out, (uint8_t *) &pkcs_block[i], *out_len);
-
-//     // Clear potentially sensitive information
-//     memset((uint8_t *) pkcs_block, 0, sizeof(pkcs_block));
-
-//     return status;
-// }
 
 static int public_block_operation(uint8_t *out, uint32_t *out_len, uint8_t *in, uint32_t in_len, rsa_pk_t *pk)
 {

@@ -1,14 +1,15 @@
 /*****************************************************************************
 Filename    : bignum.c
-Author      : 
-Date        : 
-Description : 整理数据
+Author      :
+Date        : 2025-5-11
+Description : core file for big number arithmetic operations.
 *****************************************************************************/
 #include <string.h>
-#include <pthread.h>
 #include "bignum.h"
 
 #define BN_MONT_CACHE_SLOTS 4
+#define BN_MONT_WINDOW_BITS 6
+#define BN_MONT_TABLE_SIZE (1u << (BN_MONT_WINDOW_BITS - 1))
 
 typedef struct {
     int valid;
@@ -21,13 +22,12 @@ typedef struct {
 
 static bn_mont_cache_t bn_mont_cache[BN_MONT_CACHE_SLOTS];
 static uint32_t bn_mont_cache_next = 0;
-static pthread_mutex_t bn_mont_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static bn_t bn_sub_digit_mul(bn_t *a, bn_t *b, bn_t c, bn_t *d, uint32_t digits);
 static bn_t bn_add_digit_mul(bn_t *a, bn_t *b, bn_t c, bn_t *d, uint32_t digits);
 static uint32_t bn_digit_bits(bn_t a);
 static bn_t bn_mont_inv32(bn_t n0);
-static uint32_t bn_get_window(bn_t *a, uint32_t bit);
+static uint32_t bn_get_window(bn_t *a, uint32_t bit, uint32_t width);
 static void bn_mont_shift_mod(bn_t *a, bn_t *n, uint32_t digits, uint32_t shift_digits);
 static void bn_get_mont_context(bn_t *rr, bn_t *one_mont, bn_t *n0_inv, bn_t *n, uint32_t digits);
 static void bn_mont_mul(bn_t *a, bn_t *b, bn_t *c, bn_t *n, uint32_t digits, bn_t n0_inv);
@@ -178,7 +178,6 @@ void bn_div(bn_t *a, bn_t *b, bn_t *c, uint32_t cdigits, bn_t *d, uint32_t ddigi
             cc[i+dddigits] -= bn_sub(&cc[i], &cc[i], dd, dddigits);
         }
         a[i] = ai;
-        // printf("ai[%d]: %08X\n", i, ai);
     }
 
     bn_assign_zero(b, ddigits);
@@ -250,14 +249,68 @@ void bn_mod_mul(bn_t *a, bn_t *b, bn_t *c, bn_t *d, uint32_t digits)
     memset((uint8_t *)t, 0, sizeof(t));
 }
 
+/*
+ * Montgomery modular multiplication wrapper.
+ * Computes a = b * c mod d.
+ * For odd modulus d, operands are converted into Montgomery form, multiplied,
+ * and converted back. For even modulus d, it falls back to bn_mod_mul().
+ */
+void bn_mod_mul_mont(bn_t *a, bn_t *b, bn_t *c, bn_t *d, uint32_t digits)
+{
+    bn_t bb[BN_MAX_DIGITS] = {0}, cc[BN_MAX_DIGITS] = {0};
+    bn_t bm[BN_MAX_DIGITS] = {0}, cm[BN_MAX_DIGITS] = {0}, rm[BN_MAX_DIGITS] = {0};
+    bn_t rr[BN_MAX_DIGITS] = {0}, mont_tmp[BN_MAX_DIGITS] = {0}, one[BN_MAX_DIGITS] = {0};
+    bn_t n0_inv;
+
+    if(digits == 0)
+        return;
+    if((d[0] & 1) == 0) {
+        bn_mod_mul(a, b, c, d, digits);
+        return;
+    }
+
+    bn_assign(bb, b, digits);
+    bn_assign(cc, c, digits);
+    if(bn_cmp(bb, d, digits) >= 0) {
+        bn_mod(bb, bb, digits, d, digits);
+    }
+    if(bn_cmp(cc, d, digits) >= 0) {
+        bn_mod(cc, cc, digits, d, digits);
+    }
+
+    one[0] = 1;
+    bn_get_mont_context(rr, mont_tmp, &n0_inv, d, digits);
+    bn_mont_mul(bm, bb, rr, d, digits, n0_inv);
+    bn_mont_mul(cm, cc, rr, d, digits, n0_inv);
+    bn_mont_mul(rm, bm, cm, d, digits, n0_inv);
+    bn_mont_mul(a, rm, one, d, digits, n0_inv);
+
+    memset((uint8_t *)bb, 0, sizeof(bb));
+    memset((uint8_t *)cc, 0, sizeof(cc));
+    memset((uint8_t *)bm, 0, sizeof(bm));
+    memset((uint8_t *)cm, 0, sizeof(cm));
+    memset((uint8_t *)rm, 0, sizeof(rm));
+    memset((uint8_t *)rr, 0, sizeof(rr));
+    memset((uint8_t *)mont_tmp, 0, sizeof(mont_tmp));
+    memset((uint8_t *)one, 0, sizeof(one));
+}
+
+
+/*
+ * Montgomery modular exponentiation with sliding-window method.
+ * Computes a = b^c mod d.
+ * Precomputes odd powers of the base in Montgomery form to reduce the number
+ * of modular multiplications during RSA exponentiation.
+ */
 void bn_mod_exp_mont(bn_t *a, bn_t *b, bn_t *c, uint32_t cdigits, bn_t *d, uint32_t ddigits)
 {
-    bn_t base[BN_MAX_DIGITS] = {0}, result[BN_MAX_DIGITS] = {0}, one_mont[BN_MAX_DIGITS] = {0};
+    bn_t base[BN_MAX_DIGITS] = {0}, base2[BN_MAX_DIGITS] = {0};
+    bn_t result[BN_MAX_DIGITS] = {0}, one_mont[BN_MAX_DIGITS] = {0};
     bn_t rr[BN_MAX_DIGITS] = {0}, one[BN_MAX_DIGITS] = {0};
-    bn_t table[16][BN_MAX_DIGITS] = {{0}};
+    bn_t table[BN_MONT_TABLE_SIZE][BN_MAX_DIGITS] = {{0}};
     bn_t n0_inv;
-    uint32_t i, total_bits, top_window;
-    int window;
+    uint32_t i, total_bits;
+    int bit;
 
     if(ddigits == 0)
         return;
@@ -276,29 +329,47 @@ void bn_mod_exp_mont(bn_t *a, bn_t *b, bn_t *c, uint32_t cdigits, bn_t *d, uint3
         return;
     }
 
-    bn_assign(table[0], one_mont, ddigits);
-    bn_assign(table[1], base, ddigits);
-    for(i=2; i<16; i++) {
-        bn_mont_mul(table[i], table[i - 1], base, d, ddigits, n0_inv);
+    bn_assign(table[0], base, ddigits);
+    bn_mont_mul(base2, base, base, d, ddigits, n0_inv);
+    for(i=1; i<BN_MONT_TABLE_SIZE; i++) {
+        bn_mont_mul(table[i], table[i - 1], base2, d, ddigits, n0_inv);
     }
 
     bn_assign(result, one_mont, ddigits);
     total_bits = (cdigits - 1) * BN_DIGIT_BITS + bn_digit_bits(c[cdigits - 1]);
-    top_window = (total_bits - 1) / 4;
-    for(window = (int)top_window; window >= 0; window--) {
-        uint32_t w;
-        for(i=0; i<4; i++) {
+    bit = (int)total_bits - 1;
+    while(bit >= 0) {
+        uint32_t width, start, w;
+
+        if(bn_get_window(c, (uint32_t)bit, 1) == 0) {
+            bn_mont_mul(result, result, result, d, ddigits, n0_inv);
+            bit--;
+            continue;
+        }
+
+        width = BN_MONT_WINDOW_BITS;
+        if(width > (uint32_t)bit + 1) {
+            width = (uint32_t)bit + 1;
+        }
+        start = (uint32_t)bit + 1 - width;
+        w = bn_get_window(c, start, width);
+        while((w & 1u) == 0) {
+            w >>= 1;
+            width--;
+            start++;
+        }
+
+        for(i=0; i<width; i++) {
             bn_mont_mul(result, result, result, d, ddigits, n0_inv);
         }
-        w = bn_get_window(c, (uint32_t)window * 4);
-        if(w != 0) {
-            bn_mont_mul(result, result, table[w], d, ddigits, n0_inv);
-        }
+        bn_mont_mul(result, result, table[w >> 1], d, ddigits, n0_inv);
+        bit = (int)start - 1;
     }
 
     bn_mont_mul(a, result, one, d, ddigits, n0_inv);
 
     memset((uint8_t *)base, 0, sizeof(base));
+    memset((uint8_t *)base2, 0, sizeof(base2));
     memset((uint8_t *)result, 0, sizeof(result));
     memset((uint8_t *)one_mont, 0, sizeof(one_mont));
     memset((uint8_t *)rr, 0, sizeof(rr));
@@ -306,6 +377,12 @@ void bn_mod_exp_mont(bn_t *a, bn_t *b, bn_t *c, uint32_t cdigits, bn_t *d, uint3
     memset((uint8_t *)table, 0, sizeof(table));
 }
 
+
+/*
+ * Fast modular exponentiation for RSA public exponent e = 65537.
+ * Since 65537 = 2^16 + 1, encryption only needs 16 modular squarings
+ * and 1 modular multiplication in Montgomery form.
+ */
 void bn_mod_exp_mont_e65537(bn_t *a, bn_t *b, bn_t *d, uint32_t ddigits)
 {
     bn_t base[BN_MAX_DIGITS] = {0}, result[BN_MAX_DIGITS] = {0};
@@ -474,6 +551,7 @@ static uint32_t bn_digit_bits(bn_t a)
     return i;
 }
 
+/* Compute -n^{-1} mod 2^32 for Montgomery reduction. */
 static bn_t bn_mont_inv32(bn_t n0)
 {
     bn_t x = 1;
@@ -486,19 +564,22 @@ static bn_t bn_mont_inv32(bn_t n0)
     return (bn_t)(0 - x);
 }
 
-static uint32_t bn_get_window(bn_t *a, uint32_t bit)
+/* Read a small bit window from a multi-precision exponent. */
+static uint32_t bn_get_window(bn_t *a, uint32_t bit, uint32_t width)
 {
     uint32_t digit = bit / BN_DIGIT_BITS;
     uint32_t offset = bit % BN_DIGIT_BITS;
-    uint32_t value = a[digit] >> offset;
+    uint64_t value = a[digit] >> offset;
+    uint32_t mask = (1u << width) - 1u;
 
-    if(offset > BN_DIGIT_BITS - 4 && digit + 1 < BN_MAX_DIGITS) {
-        value |= a[digit + 1] << (BN_DIGIT_BITS - offset);
+    if(offset + width > BN_DIGIT_BITS && digit + 1 < BN_MAX_DIGITS) {
+        value |= (uint64_t)a[digit + 1] << (BN_DIGIT_BITS - offset);
     }
 
-    return value & 0x0F;
+    return (uint32_t)value & mask;
 }
 
+/* Compute R or R^2 modulo n for Montgomery representation. */
 static void bn_mont_shift_mod(bn_t *a, bn_t *n, uint32_t digits, uint32_t shift_digits)
 {
     bn_t shifted[2 * BN_MAX_DIGITS + 1] = {0};
@@ -509,11 +590,14 @@ static void bn_mont_shift_mod(bn_t *a, bn_t *n, uint32_t digits, uint32_t shift_
     memset((uint8_t *)shifted, 0, sizeof(shifted));
 }
 
+/*
+ * Build or reuse Montgomery constants for one modulus.
+ * Cached values avoid recomputing R mod n, R^2 mod n, and n0_inv repeatedly.
+ */
 static void bn_get_mont_context(bn_t *rr, bn_t *one_mont, bn_t *n0_inv, bn_t *n, uint32_t digits)
 {
     uint32_t i, slot;
 
-    pthread_mutex_lock(&bn_mont_cache_lock);
     for(i=0; i<BN_MONT_CACHE_SLOTS; i++) {
         if(bn_mont_cache[i].valid &&
            bn_mont_cache[i].digits == digits &&
@@ -521,7 +605,6 @@ static void bn_get_mont_context(bn_t *rr, bn_t *one_mont, bn_t *n0_inv, bn_t *n,
             bn_assign(rr, bn_mont_cache[i].rr, digits);
             bn_assign(one_mont, bn_mont_cache[i].one_mont, digits);
             *n0_inv = bn_mont_cache[i].n0_inv;
-            pthread_mutex_unlock(&bn_mont_cache_lock);
             return;
         }
     }
@@ -541,9 +624,14 @@ static void bn_get_mont_context(bn_t *rr, bn_t *one_mont, bn_t *n0_inv, bn_t *n,
     bn_assign(rr, bn_mont_cache[slot].rr, digits);
     bn_assign(one_mont, bn_mont_cache[slot].one_mont, digits);
     *n0_inv = bn_mont_cache[slot].n0_inv;
-    pthread_mutex_unlock(&bn_mont_cache_lock);
 }
 
+
+/*
+ * Core Montgomery reduction multiplication.
+ * Inputs b and c are Montgomery-domain values.
+ * Computes a = b * c * R^{-1} mod n without division by n.
+ */
 static void bn_mont_mul(bn_t *a, bn_t *b, bn_t *c, bn_t *n, uint32_t digits, bn_t n0_inv)
 {
     dbn_t t[BN_MAX_DIGITS + 2] = {0};
@@ -564,18 +652,16 @@ static void bn_mont_mul(bn_t *a, bn_t *b, bn_t *c, bn_t *n, uint32_t digits, bn_
 
         m = (bn_t)t[0] * n0_inv;
         carry = 0;
-        for(j=0; j<digits; j++) {
+        uv = t[0] + (dbn_t)m * n[0];
+        carry = uv >> BN_DIGIT_BITS;
+        for(j=1; j<digits; j++) {
             uv = t[j] + (dbn_t)m * n[j] + carry;
-            t[j] = (bn_t)uv;
+            t[j - 1] = (bn_t)uv;
             carry = uv >> BN_DIGIT_BITS;
         }
         uv = t[digits] + carry;
-        t[digits] = (bn_t)uv;
-        t[digits + 1] += uv >> BN_DIGIT_BITS;
-
-        for(j=0; j<=digits; j++) {
-            t[j] = t[j + 1];
-        }
+        t[digits - 1] = (bn_t)uv;
+        t[digits] = t[digits + 1] + (uv >> BN_DIGIT_BITS);
         t[digits + 1] = 0;
     }
 
