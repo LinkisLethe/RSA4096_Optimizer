@@ -1,0 +1,16 @@
+Version , Run, EncryptionAverageSeconds, DecryptionAverageSeconds, EncryptionSpeedupVsPreviousStage, DecryptionSpeedupVsPreviousStage
+Baseline,   1,                 0.032666,                 9.656363,                                 ,
+Baseline,   2,                 0.032795,                 9.653695,                                 ,
+Baseline,   3,                 0.033051,                 9.632322,                                 ,
+Stage1  ,   1,                 0.014779,                 3.490391, 2.210x                          , 2.767x
+Stage1  ,   2,                 0.014803,                 3.483013, 2.215x                          , 2.772x
+Stage1  ,   3,                 0.014752,                 3.525956, 2.240x                          , 2.732x
+Stage2  ,   1,                 0.033382,                 2.960911, 0.443x                          , 1.179x
+Stage2  ,   2,                 0.032744,                 2.917333, 0.452x                          , 1.194x
+Stage2  ,   3,                 0.033247,                 2.942854, 0.444x                          , 1.198x
+Stage3  ,   1,                 0.032669,                 0.704169, 1.022x                          , 4.205x
+Stage3  ,   2,                 0.033261,                 0.707934, 0.984x                          , 4.121x
+Stage3  ,   3,                 0.032172,                 0.688977, 1.033x                          , 4.271x
+Stage4  ,   1,                 0.004165,                 0.701638, 7.844x                          , 1.004x
+Stage4  ,   2,                 0.003979,                 0.676580, 8.359x                          , 1.046x
+Stage4  ,   3,                 0.004057,                 0.680067, 7.930x                          , 1.013x
