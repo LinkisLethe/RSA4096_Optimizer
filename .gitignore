@@ -1,0 +1,6 @@
+debug/
+release/
+*.o
+*.log
+*.exe
+.DS_Store

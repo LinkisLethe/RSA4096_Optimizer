@@ -1,0 +1,24 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build release
+        run: make
+      - name: Run correctness and timing checks
+        shell: bash
+        run: |
+          set -o pipefail
+          ./release/main | tee validation.log
+          grep -Fq "[PASS] Decrypted output matches original input." validation.log
+          grep -Fq "Encrypt  : [PASS]" validation.log
+          grep -Fq "Decrypt  : [PASS]" validation.log
