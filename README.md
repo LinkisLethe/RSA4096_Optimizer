@@ -1,7 +1,7 @@
 # RSA-4096 Optimization
 
 [![C](https://img.shields.io/badge/C-GCC-A8B9CC?style=flat-square&logo=c&logoColor=white)](https://gcc.gnu.org/)
-[![Validation](https://img.shields.io/github/actions/workflow/status/LinkisLethe/rsa4096-optimization/validate.yml?branch=main&style=flat-square&label=validation)](https://github.com/LinkisLethe/rsa4096-optimization/actions/workflows/validate.yml)
+[![Validation](https://img.shields.io/github/actions/workflow/status/LinkisLethe/RSA4096_Optimizer/validate.yml?branch=main&style=flat-square&label=validation)](https://github.com/LinkisLethe/RSA4096_Optimizer/actions/workflows/validate.yml)
 [![License](https://img.shields.io/badge/license-MIT-2ea44f?style=flat-square)](LICENSE)
 
 [中文说明](README.zh-CN.md)
